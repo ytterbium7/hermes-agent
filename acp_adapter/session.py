@@ -147,6 +147,10 @@ class SessionState:
     queued_prompts: list[str] = field(default_factory=list)
     runtime_lock: Any = field(default_factory=threading.Lock)
     current_prompt_text: str = ""
+    # [CUSTOM] Fields backing the anti-double-delivery guard in server.py patch 2/3:
+    # what the last completed turn ran, and when it ended (monotonic).
+    last_completed_prompt: tuple | None = None
+    last_turn_end_ts: float = 0.0
     interrupted_prompt_text: str = ""
     # Per-session allocator for ACP assistant messageIds (lazily created by
     # the server so streamed chunks group into distinct assistant replies).
