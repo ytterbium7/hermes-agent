@@ -235,7 +235,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     _EDIT_APPROVAL_POLICY_CONFIG_ID = "edit_approval_policy"
     _EDIT_APPROVAL_POLICY_DEFAULT = "ask"
-    _MODE_DEFAULT = "default"
+    # [CUSTOM PATCH 1/3] 小米NAS 部署补丁：官方 APP 前端暂不支持渲染 ACP 审批弹窗，
+    # 保持 "default" 会让每次 write_file/patch 干等 approvals.timeout（默认 300s）后被拒。
+    # 默认改为 "dont_ask"（policy=session，自动放行非敏感路径编辑）。
+    # 原值 "default"；hermes update 后可能被覆盖，需重打。
+    _MODE_DEFAULT = "dont_ask"
     # mode id -> (edit approval policy, display name, description)
     _MODES: dict[str, tuple[str, str, str]] = {
         "default": ("ask", "Default", "Ask before edits."),
@@ -836,6 +840,30 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)
 
+        # [CUSTOM PATCH 2/3] Anti-double-delivery guard: a byte-identical prompt landing right after the
+        # previous turn finished is a client re-send (verified 2026-09-26: duplicates
+        # arrive 80-130ms after Turn ended). Drop it instead of running the turn twice.
+        import time as _time
+        with state.runtime_lock:
+            dup = (
+                state.last_completed_prompt is not None
+                and state.last_completed_prompt[0] == user_text
+                and (_time.monotonic() - state.last_turn_end_ts) < 10.0
+            )
+        if dup:
+            logger.warning(
+                "Dropped duplicate prompt on session %s (identical text %.1fs after turn end): %.80s",
+                session_id, _time.monotonic() - state.last_turn_end_ts, user_text,
+            )
+            if self._conn:
+                await self._conn.session_update(
+                    session_id,
+                    acp.update_agent_message_text(
+                        "⚠️ 检测到重复投递的消息，已忽略（与上一条完全相同）。—— 这是客户端双发防护护栏在起作用"
+                    ),
+                )
+            return PromptResponse(stop_reason="end_turn")
+
         # Slash commands are text-only; a prompt with media goes to the agent even if it starts with "/".
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
             # Off the loop: /model validates through switch_model (network I/O) and /compress
@@ -886,7 +914,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 state.current_prompt_text = ""
             return PromptResponse(stop_reason="end_turn")
 
-        return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
+        return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed, user_text)
 
     def _flush_turn_tool_calls(
         self, cbs: _TurnCallbacks, session_id: str, conn: Any, loop: asyncio.AbstractEventLoop
@@ -953,9 +981,12 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
     async def _finish_turn(
         self, state: SessionState, session_id: str, conn: Any, result: dict, pre_turn_hermes_id: Any,
-        streamed_message: bool,
+        streamed_message: bool, user_text: str = "",
     ) -> PromptResponse:
         """Persist, emit provenance/final text, drain queued prompts, report usage."""
+        # [CUSTOM PATCH 3/3] Record for the duplicate-delivery guard (patch 2/3):
+        # what this turn ran and when it ended. Original body had try/finally wrapping
+        # the whole flow — we record inside finally, before draining queued prompts.
         try:
             # Key presence, not truthiness: ``messages=[]`` is a legitimate cleared transcript (#10844);
             # only a result without the key leaves the history untouched.
@@ -999,6 +1030,11 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
+                # [CUSTOM PATCH 3/3] Record for the duplicate-delivery guard: what this
+                # turn ran and when it ended.
+                import time as _time
+                state.last_completed_prompt = (user_text, True)
+                state.last_turn_end_ts = _time.monotonic()
             await self._drain_queued_prompts(state, session_id, conn)
 
         usage = None
